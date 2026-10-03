@@ -1,0 +1,16 @@
+[project]
+name = "ops-ingest"
+version = "0.1.0"
+description = "Injects operations documents into djed's KWIM memory as curated knowledge and rules"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    "httpx",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]

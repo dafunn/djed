@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djed"
+version = "0.1.0"
+description = "Djed - ops-agent harness: Textual terminal, durable KWIM memory, MCP fleet"
+requires-python = ">=3.14"
+# SPDX string: LICENSE is at the repo root, outside this project directory.
+license = "MIT"
+dependencies = [
+    # Pinned to exact versions.
+    "pydantic-ai-slim[openai,mcp]==2.23.0",
+    "textual==8.2.8",
+    "httpx",
+
+    # Imported directly by this package.
+    "fastmcp",     # py/djed/mcp.py
+    "openai",      # py/djed/provider.py
+    "rich",        # py/djed/tui.py
+    "tiktoken",    # py/djed/tokens.py
+
+    # The build backend, locked so djed installs without a network.
+    "setuptools>=68",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools]
+# Explicit: py/ also holds entry scripts and fake_model, not part of the package.
+packages = ["djed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# For the entry scripts and fake_model, which tests import directly.
+pythonpath = ["."]

@@ -1,0 +1,187 @@
+# Djed's MCP fleet - a worked example for local development under podman.
+#
+# Every site-specific value is an environment variable. Copy it, fill in a
+# `.env` beside it (or export the names below), and bring it up:
+#
+#   podman-compose -p djed -f compose.example.yml up -d
+#   ../run_djed.sh                    # the agent, joined to `tools`
+#   ../run_build.sh spec.md           # a headless build, same network
+#
+# The project name is fixed: the launchers look for the network `djed_tools`.
+#
+# `tools` is an internal network with no route off the host. The agent attaches
+# only to `tools`, so everything it sends or receives passes through a server
+# here; the servers also attach to `egress`, which can reach outward.
+#
+# The six MCP servers are separate repositories, each publishing the Dockerfile
+# that builds it. Build them, tag them under one namespace, and name that
+# namespace in MCP_REGISTRY - `localhost` when they are only on this host:
+#
+#   podman build -t localhost/pg-mcp:latest /path/to/pg-mcp    # and the others
+#   MCP_REGISTRY=localhost
+#
+# Values you must supply:
+#
+#   MCP_REGISTRY        namespace holding the MCP server images you built
+#   DB_HOST DB_PORT     the database the read-only tier queries
+#   DB_USER             a read-only role
+#   K8S_API K8S_SA      cluster API endpoint and the read-only ServiceAccount
+#   LOKI_URL            log query endpoint
+#   FORGE_URL           your forge's base URL (forgejo-mcp reads it, repo-mcp
+#                       clones from it)
+#   GIT_OWNERS          the owners repo-mcp enumerates, e.g. `example-org`
+#   LLM_ENDPOINT        host:port of an OpenAI-compatible gateway
+#   MEMORY_ENDPOINT     host:port of the KWIM service
+#
+# Credentials are files in ./secrets, mounted as below, not variables.
+
+networks:
+  tools:
+    internal: true
+  # The model gateway and memory forwards, reachable without a seat on `tools`:
+  # a headless build agent joins this network and not `tools`, so it reaches
+  # those two and nothing else.
+  gateways:
+    internal: true
+  egress: {}
+
+volumes:
+  repo-cache:
+  workspace:
+
+services:
+  # --- Database reads -------------------------------------------------------
+  pg-mcp:
+    image: ${MCP_REGISTRY}/pg-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      PG_HOST: ${DB_HOST}
+      PG_PORT: "${DB_PORT}"
+      PG_USER: ${DB_USER}
+      PG_PASSWORD_FILE: /run/secrets/db-password
+      EXPOSE_RAW_QUERY: "true"
+      EXPOSE_METADATA: "true"
+    volumes:
+      - ./secrets:/run/secrets:ro,z
+
+  # --- Cluster reads --------------------------------------------------------
+  # Off-cluster, the server holds an auth key that can mint tokens for the
+  # read-only ServiceAccount and nothing else, and renews a short session from
+  # it. Do not substitute a personal kubeconfig: the server would then read
+  # whatever you can read.
+  k8s-mcp:
+    image: ${MCP_REGISTRY}/k8s-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      EXPOSE_LOGS: "true"
+      EXPOSE_CONFIGMAPS: "true"
+      K8S_AUTHKEY_FILE: /run/secrets/k8s-authkey
+      K8S_API_SERVER: ${K8S_API}
+      K8S_CA_FILE: /run/secrets/cluster-ca.crt
+      K8S_SESSION_SERVICE_ACCOUNT: ${K8S_SA}
+      K8S_SESSION_NAMESPACE: djed
+      K8S_SESSION_TTL_SECONDS: "21600"
+    volumes:
+      - ./secrets:/run/secrets:ro,z
+
+  # --- Log reads ------------------------------------------------------------
+  # The one tier that needs no credential.
+  loki-mcp:
+    image: ${MCP_REGISTRY}/loki-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      LOKI_URL: ${LOKI_URL}
+      EXPOSE_QUERY: "true"
+      EXPOSE_METADATA: "true"
+
+  # --- CI reads -------------------------------------------------------------
+  # MCP_ALLOWED_HOSTS is required over SSE: the transport rejects any Host
+  # header it was not told about, and here the client addresses it by container
+  # name.
+  forgejo-mcp:
+    image: ${MCP_REGISTRY}/forgejo-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      MCP_ALLOWED_HOSTS: forgejo-mcp:3000
+      FORGEJO_URL: ${FORGE_URL}
+      FORGEJO_TOKEN_FILE: /run/secrets/forge-token
+    volumes:
+      - ./secrets:/run/secrets:ro,z
+
+  # --- Repository reads -----------------------------------------------------
+  # The clone cache the headless build path provisions from (see ../BUILD.md).
+  # The cache volume is a credential store: each clone's git config carries the
+  # remote's token.
+  #
+  # GIT_BASE_URL and GIT_OWNERS are both required - the server refuses to start
+  # without them. GIT_BASE_URL reuses FORGE_URL: repo-mcp clones from the forge
+  # forgejo-mcp reads.
+  repo-mcp:
+    image: ${MCP_REGISTRY}/repo-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      GIT_BASE_URL: ${FORGE_URL}
+      GIT_OWNERS: ${GIT_OWNERS}
+      GIT_TOKEN_FILE: /run/secrets/forge-token
+      REPO_CACHE_DIR: /cache
+      REPO_DENYLIST: ""
+    volumes:
+      - repo-cache:/cache:z
+      - ./secrets:/run/secrets:ro,z
+
+  # --- Model gateway --------------------------------------------------------
+  # A socat forward to the model endpoint: one port to one address, so the
+  # agent reaches the model without a seat on `egress`.
+  llm-gateway:
+    image: docker.io/alpine/socat:latest
+    networks: [tools, gateways, egress]
+    command: ["TCP-LISTEN:4000,fork,reuseaddr", "TCP:${LLM_ENDPOINT}"]
+
+  # --- Memory ---------------------------------------------------------------
+  # The same forward for KWIM. The KWIM client fails soft, so an agent that
+  # cannot reach it logs a warning and runs with no recall.
+  kwim-gateway:
+    image: docker.io/alpine/socat:latest
+    networks: [tools, gateways, egress]
+    command: ["TCP-LISTEN:8000,fork,reuseaddr", "TCP:${MEMORY_ENDPOINT}"]
+
+  # --- Files and HTTP -------------------------------------------------------
+  # The agent's filesystem. The workspace is a named volume mounted here and
+  # nowhere else, so the agent reaches it through tools or not at all. A
+  # headless build uses a task-scoped instance instead (run_build.sh).
+  # NET_ALLOW_HOSTS is set deny-all explicitly rather than left to the image
+  # default.
+  base-mcp:
+    image: ${MCP_REGISTRY}/base-mcp:latest
+    networks: [tools, egress]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "3000"
+      FS_ALLOW_ROOTS: /workspace
+      EXPOSE_WRITE: "true"
+      NET_ALLOW_HOSTS: ""
+      AUDIT_LOG: "true"
+    volumes:
+      - workspace:/workspace:z
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
