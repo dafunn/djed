@@ -371,3 +371,57 @@ def test_startup_warns_when_the_url_is_set_without_a_key(monkeypatch):
     monkeypatch.delenv("KWIM_BASE_URL")
     monkeypatch.delenv("DJED_KWIM_API_KEY")
     assert kwim_config_warning() is None
+
+
+# --- an empty key: memory is off, and no call reaches KWIM ---------------------
+
+
+def _counting():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json=[])
+
+    return httpx.MockTransport(handler), calls
+
+
+@pytest.mark.asyncio
+async def test_an_empty_key_builds_a_disabled_client_that_makes_no_calls(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    from djed.agent import build_kwim_client
+    from djed.tools import Deps, kwim_recall
+
+    monkeypatch.setenv("KWIM_BASE_URL", "http://kwim.test:8000")
+    monkeypatch.setenv("DJED_KWIM_API_KEY", "")
+    transport, calls = _counting()
+    async with httpx.AsyncClient(transport=transport) as c:
+        with caplog.at_level("WARNING", logger="djed"):
+            kwim = build_kwim_client(c)
+            assert not kwim.available
+            assert await kwim.semantic_recall("anything") is None
+            assert await kwim.warm_start("s1", "anything") == []
+            await kwim.emit_episodic("s1", "cli_turn", {"request": "q"})
+            ctx = SimpleNamespace(deps=Deps(kwim=kwim, session_id="s1"))
+            out = await kwim_recall(ctx, "anything")
+    assert calls == []
+    assert out == "(KWIM is unavailable: DJED_KWIM_API_KEY is empty - memory is disabled)"
+    # The startup warning, once; no per-call failure warnings or notices.
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == ["KWIM_BASE_URL is set but DJED_KWIM_API_KEY is empty - memory is disabled"]
+    assert kwim.drain_notices() == []
+
+
+@pytest.mark.asyncio
+async def test_a_key_builds_a_working_client(monkeypatch):
+    from djed.agent import build_kwim_client
+
+    monkeypatch.setenv("KWIM_BASE_URL", "http://kwim.test:8000")
+    monkeypatch.setenv("DJED_KWIM_API_KEY", "k")
+    transport, calls = _counting()
+    async with httpx.AsyncClient(transport=transport) as c:
+        kwim = build_kwim_client(c)
+        assert kwim.available
+        assert await kwim.semantic_recall("anything") == []
+    assert calls == ["/v1/memory/semantic"]

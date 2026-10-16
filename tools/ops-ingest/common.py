@@ -4,11 +4,13 @@ implements read-diff-supersede.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fnmatch
 import hashlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -155,6 +157,18 @@ class KwimClient:
         r.raise_for_status()
         return r.json()
 
+    async def proposal_status(self, proposal_id: str) -> dict[str, Any] | None:
+        """The gate's decision on a proposal: {id, status, detail}. Status is
+        `accepted` until the gate decides, then `committed`, `pending_review`,
+        `rejected`, or `noop`. None if KWIM does not know the id."""
+        r = await self.client.get(
+            f"{self.base_url}/v1/proposals/{proposal_id}", headers=self.headers
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
     async def reaffirm(self, fact_id: str) -> bool:
         """Non-governance freshness touch: stamp last_verified_at = now.
 
@@ -214,6 +228,78 @@ class KwimClient:
             fact.decay_class,
             supersedes=existing.get("id"),
         )
+
+
+# --- gate outcomes ----------------------------------------------------------
+#
+# A proposal returns 202 before the gate decides it, and the gate may hold it
+# for review. After writing, the adapters wait for each decision and report it,
+# so a held fact is not mistaken for a written one.
+
+_UNDECIDED = {"accepted"}
+_OUTCOME_LABELS = {
+    "committed": "committed",
+    "pending_review": "held for review",
+    "rejected": "rejected",
+    "noop": "already committed",
+}
+
+
+async def await_outcomes(
+    client: Any,
+    proposed: list[tuple[str, str]],
+    timeout_s: float = 30.0,
+    interval_s: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Poll each (proposal_id, statement) until the gate decides it or
+    `timeout_s` runs out. Returns {proposal_id, statement, status, detail} per
+    proposal; one still undecided at the deadline keeps status `accepted`."""
+    pending = {pid: stmt for pid, stmt in proposed}
+    decided: dict[str, dict[str, Any]] = {}
+    deadline = time.monotonic() + timeout_s
+    while pending:
+        for pid in list(pending):
+            doc = await client.proposal_status(pid)
+            status = (doc or {}).get("status", "unknown")
+            if status in _UNDECIDED and time.monotonic() < deadline:
+                continue
+            decided[pid] = {"proposal_id": pid, "statement": pending.pop(pid),
+                            "status": status, "detail": (doc or {}).get("detail", "")}
+        if pending:
+            if time.monotonic() >= deadline:
+                continue  # one more pass records the stragglers as undecided
+            await asyncio.sleep(interval_s)
+    return [decided[pid] for pid, _ in proposed]
+
+
+def outcome_counts(outcomes: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for o in outcomes:
+        counts[o["status"]] = counts.get(o["status"], 0) + 1
+    return counts
+
+
+def format_outcomes(outcomes: list[dict[str, Any]], skipped: dict[str, int] | None = None) -> str:
+    """A report of what the gate did: counts, then every proposal that did not
+    commit, with the gate's reason."""
+    counts = outcome_counts(outcomes)
+    parts = [f"{counts.get(s, 0)} {label}" for s, label in _OUTCOME_LABELS.items()]
+    undecided = sum(n for s, n in counts.items() if s not in _OUTCOME_LABELS)
+    if undecided:
+        parts.append(f"{undecided} not yet decided")
+    for reason, n in sorted((skipped or {}).items()):
+        parts.append(f"{n} skipped ({reason})")
+    lines = [f"# gate outcomes: {', '.join(parts)}"]
+    for o in outcomes:
+        if o["status"] in ("committed", "noop"):
+            continue
+        label = _OUTCOME_LABELS.get(o["status"], f"not yet decided ({o['status']})")
+        lines.append(f"[{label}] {o['statement']}")
+        detail = o["detail"] or f"see GET /v1/proposals/{o['proposal_id']}"
+        lines.append(f"    {detail}")
+    if counts.get("pending_review"):
+        lines.append("Held proposals wait in GET /v1/review/pending (or the console's Proposals tab).")
+    return "\n".join(lines)
 
 
 def kwim_url_from_env() -> str:

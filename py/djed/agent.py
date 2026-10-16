@@ -25,21 +25,26 @@ log = logging.getLogger("djed.agent")
 def kwim_config_warning() -> str | None:
     """Why memory will not work as configured, or None.
 
-    A KWIM URL with no key gets a 401 on every call; the client fails soft, so
-    without this the session would run with no memory and say nothing."""
+    A KWIM URL with no key builds a disabled client, so without this the
+    session would run with no memory and say nothing. Neither set means KWIM is
+    not configured, which needs no warning."""
     if os.environ.get("KWIM_BASE_URL") and not os.environ.get("DJED_KWIM_API_KEY"):
         return "KWIM_BASE_URL is set but DJED_KWIM_API_KEY is empty - memory is disabled"
     return None
 
 
 def build_kwim_client(http: httpx.AsyncClient) -> KwimClient:
+    """The session's KWIM client. With no key it is built disabled and makes no
+    calls to KWIM."""
     warning = kwim_config_warning()
     if warning:
         log.warning(warning)
+    api_key = os.environ.get("DJED_KWIM_API_KEY", "")
     return KwimClient(
         http,
         base_url=kwim_base(),
-        api_key=os.environ.get("DJED_KWIM_API_KEY", ""),
+        api_key=api_key,
+        disabled=None if api_key else "DJED_KWIM_API_KEY is empty - memory is disabled",
     )
 
 

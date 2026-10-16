@@ -3,7 +3,9 @@
 Reads only allow-listed files from an inventory checkout, syncing by
 read-diff-supersede. Dry run by default: it prints the facts it would sync and
 writes nothing until given --commit. Writing needs KWIM_BASE_URL and
-DJED_KWIM_API_KEY.
+DJED_KWIM_API_KEY. After writing it waits (up to --wait seconds) for KWIM's gate
+to decide each proposal and prints what it did (committed, held for review,
+rejected).
 
     python -m ansible_source --team <team> --inventory <path> --conf <path> --env <env> [--commit]
 """
@@ -23,6 +25,9 @@ from common import (
     DesiredFact,
     KwimClient,
     add_common_args,
+    await_outcomes,
+    format_outcomes,
+    outcome_counts,
     fact_identity,
     kwim_key_from_env,
     kwim_url_from_env,
@@ -380,10 +385,14 @@ async def run_ansible_source(
     roles_path: Path,
     env: str,
     dry_run: bool = False,
+    wait_s: float = 30.0,
 ) -> dict[str, Any]:
     """Read the ansible inventory tree and sync ops facts into KWIM.
 
     dry_run=True prints proposals and makes no network calls; client may be None.
+    Otherwise, after proposing, waits up to `wait_s` for the gate to decide each
+    proposal and prints what it did (committed, held for review, rejected), with
+    the reason for each that did not commit. `wait_s=0` skips the wait.
     """
     facts, summary = collect_desired_facts(path, env, roles_path)
 
@@ -395,8 +404,23 @@ async def run_ansible_source(
         print(f"\n# summary: {summary}")
         return summary
 
+    proposed: list[tuple[str, str]] = []
+    skipped: dict[str, int] = {}
     for fact in facts:
-        await client.sync_fact(fact)
+        result = await client.sync_fact(fact)
+        if result.get("skipped"):
+            reason = result.get("reason", "skipped")
+            skipped[reason] = skipped.get(reason, 0) + 1
+        elif result.get("proposal_id"):
+            proposed.append((result["proposal_id"], fact.statement))
+
+    if proposed and wait_s > 0:
+        outcomes = await await_outcomes(client, proposed, timeout_s=wait_s)
+        print(format_outcomes(outcomes, skipped))
+        summary["outcomes"] = outcome_counts(outcomes)
+    else:
+        print(f"# proposed {len(proposed)}, skipped {sum(skipped.values())} {skipped or ''}".rstrip())
+    summary["skipped"] = skipped
 
     log.info("ansible_source done: %s", summary)
     return summary
@@ -422,6 +446,7 @@ async def run_reconcile(
     dry_run: bool = False,
     allow_override: bool = False,
     owned_query_limit: int = 10000,
+    wait_s: float = 30.0,
 ) -> dict[str, Any]:
     """Tombstone owned facts whose entity left the desired set.
 
@@ -438,6 +463,7 @@ async def run_reconcile(
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     per_type: dict[str, dict[str, Any]] = {}
     tombstones: list[dict[str, Any]] = []
+    tombstone_ids: list[tuple[str, str]] = []   # (proposal_id, statement), for the report
 
     for fact_type in MANAGED_FACT_TYPES:
         owned = await client.query_owned(fact_type, limit=owned_query_limit)
@@ -502,6 +528,8 @@ async def run_reconcile(
                     statement, fact_type, about, supersedes=orphan.get("id"),
                 )
                 tombstones.append(proposed)
+                if proposed.get("proposal_id"):
+                    tombstone_ids.append((proposed["proposal_id"], statement))
             record["tombstoned"] += 1
 
         per_type[fact_type] = record
@@ -519,6 +547,9 @@ async def run_reconcile(
             )
             print(f"        {t['statement']}")
         print(f"\n# per_type: {per_type}")
+
+    elif tombstone_ids and wait_s > 0:
+        print(format_outcomes(await await_outcomes(client, tombstone_ids, timeout_s=wait_s)))
 
     log.info("reconcile done: %s", per_type)
     return {"per_type": per_type, "tombstones": tombstones}
@@ -566,7 +597,8 @@ async def _amain(args: argparse.Namespace) -> int:
         kwim = KwimClient(client, args.kwim_url, api_key)
         for team in teams:
             if not dry_run:
-                await run_ansible_source(kwim, inventory, roles_path, env=args.env)
+                await run_ansible_source(kwim, inventory, roles_path, env=args.env,
+                                         wait_s=args.wait)
             else:
                 await run_ansible_source(
                     None, inventory, roles_path, env=args.env, dry_run=True
@@ -575,6 +607,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 await run_reconcile(
                     kwim, inventory, roles_path, env=args.env,
                     dry_run=dry_run, allow_override=args.reconcile_override_cap,
+                    wait_s=args.wait,
                 )
     return 0
 
@@ -594,6 +627,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="write the facts to KWIM; without it this is a dry run that prints "
                          "what would be synced (no network, no key required unless combined "
                          "with --reconcile)")
+    ap.add_argument("--wait", type=float, default=30.0,
+                    help="with --commit, seconds to wait for the gate's decision on each "
+                         "proposal before reporting it (default 30; 0 reports without waiting)")
     ap.add_argument("--dry-run", action="store_true",
                     help="the default; accepted so existing invocations still run without writing")
     ap.add_argument("--reconcile", action="store_true",

@@ -69,17 +69,26 @@ class KwimClient:
     """
 
     def __init__(
-        self, client: httpx.AsyncClient, base_url: str | None = None, api_key: str = ""
+        self,
+        client: httpx.AsyncClient,
+        base_url: str | None = None,
+        api_key: str = "",
+        disabled: str | None = None,
     ):
+        """`disabled` is why memory is off (e.g. no key). A disabled client makes
+        no calls: recall reports the reason, warm-start and recording do nothing.
+        """
         self.client = client
+        self.disabled = disabled
         self.base_url = (base_url or kwim_base()).rstrip("/")
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         # What this turn recalled from KWIM, by id. The session clears it when a
         # turn starts and records it with the turn, so the distiller can tell
         # recalled knowledge from new evidence.
         self._recalled: dict[str, dict[str, str]] = {}
-        # Why the most recent call failed; None once a call succeeds.
-        self.last_failure: str | None = None
+        # Why the most recent call failed; None once a call succeeds. A disabled
+        # client starts, and stays, failed with its reason.
+        self.last_failure: str | None = disabled
         self._failure_kinds: set[str] = set()
         self._notices: list[str] = []
 
@@ -131,6 +140,8 @@ class KwimClient:
 
         Returns None when the call failed, so a caller can tell "KWIM is down"
         from "KWIM has nothing on this"; `last_failure` says why."""
+        if self.disabled:
+            return None
         if not query.strip():
             return []
         k = k or recall_k()
@@ -161,6 +172,8 @@ class KwimClient:
 
     async def warm_start(self, session_id: str, subject: str) -> list[str]:
         """First-turn bundle: prior wisdom + known facts for this session/subject."""
+        if self.disabled:
+            return []
         try:
             params: dict[str, Any] = {"session_id": session_id}
             if subject:
@@ -198,6 +211,8 @@ class KwimClient:
 
         Fire-and-forget: memory writes never break a turn.
         """
+        if self.disabled:
+            return
         try:
             r = await self.client.post(
                 f"{self.base_url}/v1/memory/episodic",
