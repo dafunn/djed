@@ -1,8 +1,9 @@
 """Post curated :Rule constraints to /v1/wisdom/seed. Idempotent on rule id.
 
 Dry-run by default; --commit writes. Needs KWIM_BASE_URL and DJED_KWIM_API_KEY.
+The rules go to the team the key belongs to; there is no --team.
 
-    python -m seed_guardrails --team <team> --conf <path> [--commit]
+    python -m seed_guardrails --conf <path> [--commit]
 """
 from __future__ import annotations
 

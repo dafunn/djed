@@ -240,3 +240,13 @@ def test_shipped_guardrail_yaml_resolves_as_specified(action, expected):
     """The corpus gets the expected verdicts from the patterns actually seeded."""
     shipped = _shipped_rules()
     assert _resolve([shipped[rid] for rid in PINNED_RULE_IDS], action) == expected
+
+
+def test_the_documented_usage_matches_the_parser():
+    """The tenant comes from the key: the usage line must not offer --team, and
+    the parser rejects it."""
+    usage = [ln for ln in seed_guardrails.__doc__.splitlines() if "python -m seed_guardrails" in ln]
+    assert usage and "--team" not in usage[0]
+    with pytest.raises(SystemExit) as exc:
+        seed_guardrails.main(["--team", "team-a", "--conf", "/nonexistent"])
+    assert exc.value.code == 2

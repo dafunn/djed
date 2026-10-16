@@ -438,3 +438,109 @@ async def test_episodic_record_carries_the_outcome():
     assert event_type == "cli_turn"
     assert data["outcome"] == "ok"
     assert data["request"] == "hello"
+
+
+class NotingKwim(RecordingKwim):
+    """Recalls two items per lookup and notes them, as the real client does."""
+
+    async def semantic_recall(self, query, k=4):
+        self._note_recalled("semantic", "runbook:backups", "Snapshots start at 02:15 UTC.")
+        self._note_recalled("fact", "fact-1", "quokka-07 is the backup host.")
+        return ["[backups | 0.30]\nSnapshots start at 02:15 UTC."]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_records_what_it_recalled():
+    kwim = NotingKwim()
+    agent = build_agent(kwim, "s", model=text_model(
+        lambda m, i: ModelResponse(parts=[TextPart(content="02:15")])))
+    session = Session(agent, Deps(kwim=kwim, session_id="s"), kwim, "s")
+    await session.run_turn("when are backups?", lambda e: None, approve_all)
+    _, _, data = kwim.episodic[-1]
+    assert [i["id"] for i in data["recalled"]] == ["runbook:backups", "fact-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_recalls_nothing_has_no_recalled_key():
+    session, kwim = recording_session(model=text_model(
+        lambda m, i: ModelResponse(parts=[TextPart(content="hi")])))
+    await session.run_turn("hello", lambda e: None, approve_all)
+    _, _, data = kwim.episodic[-1]
+    assert "recalled" not in data
+
+
+@pytest.mark.asyncio
+async def test_each_turn_records_only_its_own_recall():
+    kwim = NotingKwim()
+    agent = build_agent(kwim, "s", model=text_model(
+        lambda m, i: ModelResponse(parts=[TextPart(content="ok")])))
+    session = Session(agent, Deps(kwim=kwim, session_id="s"), kwim, "s")
+    await session.run_turn("first", lambda e: None, approve_all)
+    kwim.semantic_recall = RecordingKwim.semantic_recall.__get__(kwim)   # recalls nothing now
+    await session.run_turn("second", lambda e: None, approve_all)
+    assert "recalled" in kwim.episodic[0][2]
+    assert "recalled" not in kwim.episodic[1][2]
+
+
+# --- tool errors ----------------------------------------------------------
+
+
+def _mcp_toolset():
+    """An in-process MCP server with one tool that fails and one that works."""
+    from fastmcp import FastMCP
+    from fastmcp.client import Client
+    from fastmcp.exceptions import ToolError
+    from pydantic_ai.mcp import MCPToolset
+
+    server = FastMCP("fleet")
+
+    @server.tool
+    def refuse(repo: str) -> str:
+        raise ToolError(f"repo {repo!r} is not in REPO_ALLOWLIST")
+
+    @server.tool
+    def answer(repo: str) -> str:
+        return f"{repo}: 3 runs"
+
+    return MCPToolset(Client(server), id="fleet")
+
+
+def _calls_then_answers(tool: str):
+    """Calls `tool` once, then answers in text once the result is back."""
+    from pydantic_ai.models.function import DeltaToolCall
+
+    async def stream(messages, info):
+        if len(messages) == 1:
+            yield {0: DeltaToolCall(name=tool, json_args='{"repo": "owner/x"}', tool_call_id="c1")}
+        else:
+            yield "done"
+
+    return FunctionModel(stream_function=stream)
+
+
+async def _tool_finished(tool: str):
+    from djed.session import ToolFinished
+
+    kwim = StubKwim()
+    agent = build_agent(kwim, "s", model=_calls_then_answers(tool), toolsets=[_mcp_toolset()])
+    session = Session(agent, Deps(kwim=kwim, session_id="s"), kwim, "s")
+    events: list = []
+    async with agent:
+        await session.run_turn("go", collect(events), approve_all)
+    return [e for e in events if isinstance(e, ToolFinished)]
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_error_result_is_reported_as_an_error():
+    finished = await _tool_finished("refuse")
+    assert len(finished) == 1
+    assert finished[0].is_error is True
+    assert "is not in REPO_ALLOWLIST" in finished[0].full
+
+
+@pytest.mark.asyncio
+async def test_a_normal_mcp_result_is_not_an_error():
+    finished = await _tool_finished("answer")
+    assert len(finished) == 1
+    assert finished[0].is_error is False
+    assert "owner/x: 3 runs" in finished[0].full

@@ -61,6 +61,11 @@ class KwimClient:
     Every method is fail-soft by contract: network errors, non-200s, and
     unexpected payload shapes all degrade to "no memory", never an exception.
     A turn must survive KWIM being down.
+
+    Failing soft is not failing silently: the first failure of each kind (an
+    HTTP status, a connection error, a bad payload) is logged as a warning and
+    queued for `drain_notices`, so a bad key or an unreachable KWIM shows once
+    per session. Repeats go to debug.
     """
 
     def __init__(
@@ -69,9 +74,63 @@ class KwimClient:
         self.client = client
         self.base_url = (base_url or kwim_base()).rstrip("/")
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        # What this turn recalled from KWIM, by id. The session clears it when a
+        # turn starts and records it with the turn, so the distiller can tell
+        # recalled knowledge from new evidence.
+        self._recalled: dict[str, dict[str, str]] = {}
+        # Why the most recent call failed; None once a call succeeds.
+        self.last_failure: str | None = None
+        self._failure_kinds: set[str] = set()
+        self._notices: list[str] = []
 
-    async def semantic_recall(self, query: str, k: int | None = None) -> list[str]:
-        """KNN recall over the ops knowledge base, formatted for context injection."""
+    @property
+    def available(self) -> bool:
+        """False after a failed call, until a call succeeds."""
+        return self.last_failure is None
+
+    def drain_notices(self) -> list[str]:
+        """First-of-their-kind failures since the last drain, for display."""
+        out, self._notices = self._notices, []
+        return out
+
+    def _ok(self) -> None:
+        self.last_failure = None
+
+    def _failed(self, op: str, kind: str, reason: str) -> None:
+        self.last_failure = reason
+        if kind in self._failure_kinds:
+            log.debug("%s failed (fail-soft): %s", op, reason)
+            return
+        self._failure_kinds.add(kind)
+        notice = f"KWIM {op} failed: {reason} - memory is unavailable until it recovers"
+        log.warning(notice)
+        self._notices.append(notice)
+
+    def _http_failure(self, op: str, r: httpx.Response) -> None:
+        hint = " (check DJED_KWIM_API_KEY)" if r.status_code in (401, 403) else ""
+        self._failed(op, f"http-{r.status_code}", f"HTTP {r.status_code}{hint}")
+
+    def _error_failure(self, op: str, e: Exception) -> None:
+        self._failed(op, type(e).__name__, f"{type(e).__name__}: {e}")
+
+    def begin_turn(self) -> None:
+        """Forget what the previous turn recalled."""
+        self._recalled = {}
+
+    def recalled_items(self) -> list[dict[str, str]]:
+        """Items recalled since `begin_turn`, once each: {kind, id, text}."""
+        return list(self._recalled.values())
+
+    def _note_recalled(self, kind: str, item_id: Any, text: str) -> None:
+        text = (text or "").strip()
+        if item_id and text:
+            self._recalled.setdefault(str(item_id), {"kind": kind, "id": str(item_id), "text": text[:300]})
+
+    async def semantic_recall(self, query: str, k: int | None = None) -> list[str] | None:
+        """KNN recall over the ops knowledge base, formatted for context injection.
+
+        Returns None when the call failed, so a caller can tell "KWIM is down"
+        from "KWIM has nothing on this"; `last_failure` says why."""
         if not query.strip():
             return []
         k = k or recall_k()
@@ -82,19 +141,23 @@ class KwimClient:
                 headers=self.headers,
             )
             if r.status_code != 200:
-                return []
+                self._http_failure("recall", r)
+                return None
             items = r.json()
             if not isinstance(items, list):
-                return []
+                self._failed("recall", "payload", "unexpected response shape")
+                return None
+            self._ok()
             out = []
             for it in items:
                 topic = (it.get("metadata") or {}).get("topic", "note")
                 score = it.get("score") or 0.0
                 out.append(f"[{topic} | {score:.2f}]\n{it.get('content', '')}")
+                self._note_recalled("semantic", it.get("id"), it.get("content", ""))
             return out
         except Exception as e:
-            log.debug("semantic_recall failed (fail-soft): %s", e)
-            return []
+            self._error_failure("recall", e)
+            return None
 
     async def warm_start(self, session_id: str, subject: str) -> list[str]:
         """First-turn bundle: prior wisdom + known facts for this session/subject."""
@@ -106,20 +169,26 @@ class KwimClient:
                 f"{self.base_url}/v1/memory/context", params=params, headers=self.headers
             )
             if r.status_code != 200:
+                self._http_failure("warm-start", r)
                 return []
             ctx = r.json()
             if not isinstance(ctx, dict):
+                self._failed("warm-start", "payload", "unexpected response shape")
                 return []
+            self._ok()
             out = []
             for w in ctx.get("wisdom") or []:
                 approach = w.get("approach") or w.get("action_pattern") or ""
                 out.append(f"WISDOM: {approach.strip()}")
+                self._note_recalled("rule", w.get("id"), approach)
             for f in ctx.get("knowledge") or []:
-                out.append(f"KNOWN: {(f.get('statement') or f.get('content') or '').strip()}")
+                statement = (f.get("statement") or f.get("content") or "").strip()
+                out.append(f"KNOWN: {statement}")
+                self._note_recalled("fact", f.get("id"), statement)
             # Longer than the bare "KNOWN: " prefix, i.e. it has a body.
             return [s.strip() for s in out if len(s.strip()) > len("KNOWN: ")]
         except Exception as e:
-            log.debug("warm_start failed (fail-soft): %s", e)
+            self._error_failure("warm-start", e)
             return []
 
     async def emit_episodic(
@@ -130,7 +199,7 @@ class KwimClient:
         Fire-and-forget: memory writes never break a turn.
         """
         try:
-            await self.client.post(
+            r = await self.client.post(
                 f"{self.base_url}/v1/memory/episodic",
                 json={
                     "agent_id": default_persona().tag,
@@ -140,8 +209,12 @@ class KwimClient:
                 },
                 headers=self.headers,
             )
+            if r.status_code >= 300:
+                self._http_failure("record", r)
+            else:
+                self._ok()
         except Exception as e:
-            log.debug("emit_episodic failed (fail-soft): %s", e)
+            self._error_failure("record", e)
 
 
 # --- message-list surgery -------------------------------------------------
@@ -266,7 +339,7 @@ def make_transform_context(kwim: KwimClient, session_id: str):
         if not warmed_up:
             warmed_up = True
             blocks.extend(await kwim.warm_start(session_id, query))
-        blocks.extend(await kwim.semantic_recall(query))
+        blocks.extend(await kwim.semantic_recall(query) or [])
         result = _inject(recent, blocks) if blocks else recent
 
         # Pydantic AI rejects an empty processed history, which ends the turn.

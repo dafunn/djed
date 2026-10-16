@@ -18,8 +18,8 @@ read-only MCP servers. The default agent identity is Maat.
   window clear.
 - **Sandboxed cluster access.** Cluster reads go through the MCP tiers (RBAC
   `view` only: no mutation, no Secrets), never a mounted kubeconfig. The agent
-  runs in a minimal container, and every shell command is operator-approved at
-  the TUI before it runs. Against the local fleet that container joins only an
+  runs in a minimal container, and every shell command and file write is
+  operator-approved at the TUI before it runs. Against the local fleet that container joins only an
   internal network, so everything it sends or receives passes through one of the
   tools; `podman/compose.example.yml` is the worked topology.
 - **An unattended mode.** Hand it a spec file and it provisions a workspace,
@@ -83,4 +83,24 @@ inside the JSON server list.
 `run_djed.sh` is a development launcher: it port-forwards the in-cluster MCP
 services, preflights them, then starts the sandboxed TUI. Adapt it to your
 environment.
+
+### Version
+
+djed reports its release in the TUI banner, in `--version` (`tui.py`,
+`headless.py`, `build.py`), and as `clientInfo` in the MCP `initialize`
+handshake, so each server sees which djed connected. The code runs from the
+checkout, not from the sandbox image, so the version is read from the checkout
+at startup: the nearest `djed-v*` tag (`git describe --tags --match 'djed-v*'`),
+with a `-<n>-g<sha>` suffix for commits after it. A copy with no git history
+reports `dev`; set `DJED_VERSION` in the process environment to name it instead.
+
+## Running the tests
+
+Two suites, each its own uv project. They need Python 3.14 and uv, and no KWIM,
+model, or MCP server:
+
+```bash
+(cd py && uv sync --frozen --extra dev && .venv/bin/python -m pytest tests)
+(cd tools/ops-ingest && uv sync --frozen --extra dev && .venv/bin/python -m pytest tests)
+```
 

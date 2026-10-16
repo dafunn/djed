@@ -370,6 +370,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "mcp" },
     { name = "openai" },
     { name = "pydantic-ai-slim", extra = ["mcp", "openai"] },
     { name = "rich" },
@@ -388,6 +389,7 @@ dev = [
 requires-dist = [
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "mcp" },
     { name = "openai" },
     { name = "pydantic-ai-slim", extras = ["openai", "mcp"], specifier = "==2.23.0" },
     { name = "pytest", marker = "extra == 'dev'" },

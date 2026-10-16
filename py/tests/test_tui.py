@@ -571,3 +571,31 @@ async def test_ctrl_o_does_not_disturb_the_prompt():
         await pilot.press("ctrl+o")
         await pilot.pause()
         assert app.query_one(PromptArea).text == "half-typed question"
+
+
+# --- memory failures ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_kwim_failure_is_shown_once_after_the_turn():
+    async def answer(messages, info: AgentInfo):
+        yield "ok"
+
+    session = make_session(FunctionModel(stream_function=answer))
+
+    async def failing_recall(query, k=4):
+        session.kwim._failed("recall", "http-401", "HTTP 401 (check DJED_KWIM_API_KEY)")
+        return None
+
+    session.kwim.semantic_recall = failing_recall  # type: ignore[method-assign]
+    app = DjedApp(session)
+    async with app.run_test() as pilot:
+        await submit(pilot, "hello")
+        assert await wait_for(app, "[memory] KWIM recall failed: HTTP 401"), transcript_text(app)
+        await submit(pilot, "hello again")
+        for _ in range(60):
+            if transcript_text(app).count("request(s)]") == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert transcript_text(app).count("request(s)]") == 2, transcript_text(app)
+    assert transcript_text(app).count("[memory]") == 1

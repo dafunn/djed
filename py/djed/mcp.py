@@ -16,11 +16,13 @@ from typing import Any
 
 from fastmcp.client import Client
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+from mcp.types import Implementation
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import RenamedToolset
 
 from .tiers import Tier
 from .tokens import estimate_tool_tokens
+from .version import release_version
 
 log = logging.getLogger("djed.mcp")
 
@@ -89,6 +91,11 @@ def _client_timeout_s(cfg: dict[str, Any]) -> float:
     return float(raw) if raw is not None else mcp_timeout_s()
 
 
+def client_info() -> Implementation:
+    """What djed sends as `clientInfo` in the MCP initialize handshake."""
+    return Implementation(name="djed", version=release_version())
+
+
 def build_mcp_servers(
     cfgs: list[dict[str, Any]] | None = None,
 ) -> tuple[list[McpServer], list[tuple[str, str]]]:
@@ -103,7 +110,11 @@ def build_mcp_servers(
     for cfg in cfgs:
         name = cfg["name"]
         try:
-            client = Client(_transport(cfg), timeout=_client_timeout_s(cfg))
+            client = Client(
+                _transport(cfg),
+                timeout=_client_timeout_s(cfg),
+                client_info=client_info(),
+            )
             servers.append(McpServer(name, client, MCPToolset(client, id=name)))
         except Exception as e:
             errors.append((name, str(e)))

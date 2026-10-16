@@ -1,9 +1,11 @@
 """Ops ansible adapter - emit host/access/topology facts into KWIM.
 
 Reads only allow-listed files from an inventory checkout, syncing by
-read-diff-supersede. Needs KWIM_BASE_URL and DJED_KWIM_API_KEY.
+read-diff-supersede. Dry run by default: it prints the facts it would sync and
+writes nothing until given --commit. Writing needs KWIM_BASE_URL and
+DJED_KWIM_API_KEY.
 
-    python -m ansible_source --team <team> --inventory <path> --conf <path>
+    python -m ansible_source --team <team> --inventory <path> --conf <path> --env <env> [--commit]
 """
 from __future__ import annotations
 
@@ -543,12 +545,17 @@ async def _amain(args: argparse.Namespace) -> int:
         return 2
     roles_path = conf_dir / "ops-host-roles.yaml"
 
-    if args.dry_run and not args.reconcile:
+    if args.commit and args.dry_run:
+        log.error("--commit and --dry-run contradict each other; pass one")
+        return 2
+    dry_run = not args.commit
+
+    if dry_run and not args.reconcile:
         # No network, no key needed - just print what would be synced.
         await run_ansible_source(None, inventory, roles_path, env=args.env, dry_run=True)
         return 0
 
-    # --reconcile needs read access even in --dry-run mode (it queries owned
+    # --reconcile needs read access even in a dry run (it queries owned
     # facts from KWIM to compute the orphan set) - only the writes are skipped.
     api_key = args.key or kwim_key_from_env()
     if not api_key:
@@ -558,7 +565,7 @@ async def _amain(args: argparse.Namespace) -> int:
     async with httpx.AsyncClient() as client:
         kwim = KwimClient(client, args.kwim_url, api_key)
         for team in teams:
-            if not args.dry_run:
+            if not dry_run:
                 await run_ansible_source(kwim, inventory, roles_path, env=args.env)
             else:
                 await run_ansible_source(
@@ -567,7 +574,7 @@ async def _amain(args: argparse.Namespace) -> int:
             if args.reconcile:
                 await run_reconcile(
                     kwim, inventory, roles_path, env=args.env,
-                    dry_run=args.dry_run, allow_override=args.reconcile_override_cap,
+                    dry_run=dry_run, allow_override=args.reconcile_override_cap,
                 )
     return 0
 
@@ -583,9 +590,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--env", required=True, help="coarse environment label")
     ap.add_argument("--kwim-url", default=kwim_url_from_env(), help="KWIM service base URL")
     ap.add_argument("--key", default=kwim_key_from_env(), help="DJED KWIM API key")
+    ap.add_argument("--commit", action="store_true",
+                    help="write the facts to KWIM; without it this is a dry run that prints "
+                         "what would be synced (no network, no key required unless combined "
+                         "with --reconcile)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="print the facts that would be synced; no network, no key required "
-                         "unless combined with --reconcile")
+                    help="the default; accepted so existing invocations still run without writing")
     ap.add_argument("--reconcile", action="store_true",
                     help="also run the decommission reconcile phase "
                          "(tombstones orphaned facts); off by default")

@@ -9,7 +9,9 @@ a response.
 
 `elide_tool_results` replaces the payload of older results with a note naming
 the call that produced it. Each call stays paired with its result, so the
-transcript stays valid.
+transcript stays valid. A `load_skill` result is never elided and does not count
+against the budget: the model follows a skill for the rest of the conversation,
+and would not know to reload one that had been replaced.
 """
 from __future__ import annotations
 
@@ -24,6 +26,8 @@ from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturnPart,
 )
+
+from .skills import LOAD_SKILL_TOOL
 
 # Characters of tool-result payload kept whole, newest first; older results are
 # elided. A character budget, not a count, because `cap.py` allows 8KB per
@@ -104,7 +108,7 @@ def elide_tool_results(
     """Replace older tool-result payloads with a note naming the call.
 
     Newest results are kept whole until `budget` characters are used; older ones
-    are elided. A budget of 0 elides every result.
+    are elided. A budget of 0 elides every result except a loaded skill.
     """
     budget = result_budget() if budget is None else budget
     calls = _call_index(messages)
@@ -117,6 +121,8 @@ def elide_tool_results(
             continue
         for p in reversed(m.parts):
             if not isinstance(p, ToolReturnPart) or not isinstance(p.content, str):
+                continue
+            if p.tool_name == LOAD_SKILL_TOOL:
                 continue
             size = len(p.content)
             if spend + size <= budget:

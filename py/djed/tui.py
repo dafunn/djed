@@ -21,6 +21,7 @@ from .persona import MAAT, Persona
 from .history import History
 from .provider import list_models, model_id
 from .session import Session, TextChunk, ToolFinished, ToolStarted
+from .skills import Skill, oversize_warning, render_loaded
 from .tiers import resolve_selection
 from .tools import MAX_OUTPUT, SHELL_TIMEOUT_S
 
@@ -44,13 +45,14 @@ CTRL_D_WINDOW_S = 2.0
 STREAM_REFRESH_S = 0.08  # re-render the streaming block at most this often
 
 HELP = """\
-commands  `/model [id]`  `/tier [spec]`  `/strategy [eager|search]`  `/save [path]`  `/copy`  `/clear`  `/help`  `/exit`
+commands  `/model [id]`  `/tier [spec]`  `/strategy [eager|search]`  `/skill [name [request]]`  `/save [path]`  `/copy`  `/clear`  `/help`  `/exit`
 shell  `!<cmd>`   interrupt  `Esc` or `ctrl+c`   exit  `ctrl+d` twice
 prompt  `enter` sends, `alt+enter` (or `ctrl+j`) adds a line; paste keeps its line breaks
 tool output  `ctrl+o` toggles between the 120-character summary and the full text
 copying  drag to select then `ctrl+c`, or `shift`+drag for your terminal's own selection.
 `/save` writes the transcript (tool output untruncated) to a file - the reliable way to share an error.
-`/tier` takes `all`, `none`, `cluster,db`, or deltas like `+cluster,-db`."""
+`/tier` takes `all`, `none`, `cluster,db`, or deltas like `+cluster,-db`.
+`/skill` lists skills; `/skill name request` sends the skill with the request, and `/skill name` alone sends it with your next prompt."""
 
 
 class Transcript(VerticalScroll):
@@ -140,6 +142,8 @@ class DjedApp(App):
         # and its widget.
         self._verbose_tools = False
         self._tool_widgets: list[tuple[Static, str, str]] = []
+        # Skills from `/skill name`, sent in front of the next prompt.
+        self._pending_skills: list[Skill] = []
 
     # --- layout -----------------------------------------------------------
 
@@ -227,7 +231,7 @@ class DjedApp(App):
             )
             self._append(line, f"[tool] {event.name} {event.args}").add_class("tool")
         elif isinstance(event, ToolFinished):
-            marker = "[exit] " if event.is_error else "[ok] "
+            marker = "[error] " if event.is_error else "[ok] "
             # Collapsed to one line by default, with the full text kept. New results follow
             # the current mode.
             short = f"  {marker}{event.text}"
@@ -424,7 +428,16 @@ class DjedApp(App):
             await self.run_shell(line[1:])
             return
 
-        self._turn = asyncio.create_task(self.run_turn(line))
+        prompt = line
+        if self._pending_skills:
+            try:
+                prompt = self._with_skills(self._pending_skills, line)
+            except OSError as e:
+                self.say(f"could not read skill: {e}", "err")
+                return
+            finally:
+                self._pending_skills = []
+        self._turn = asyncio.create_task(self.run_turn(prompt))
 
     # --- turn -------------------------------------------------------------
 
@@ -447,6 +460,10 @@ class DjedApp(App):
                     "muted",
                 )
         finally:
+            # Memory fails soft, so a turn that lost it still answers; say so
+            # once per kind of failure rather than leave it silent.
+            for notice in self.session.kwim.drain_notices():
+                self.say(f"[memory] {notice}", "warn")
             if self._alive:
                 self.query_one(PromptArea).placeholder = self._placeholder
             self._turn = None
@@ -472,6 +489,9 @@ class DjedApp(App):
     # --- commands ---------------------------------------------------------
 
     async def run_command(self, line: str) -> None:
+        if line[1:].split(None, 1)[:1] == ["skill"]:
+            self.cmd_skill(line)
+            return
         parts = shlex.split(line[1:]) if len(line) > 1 else []
         cmd = parts[0] if parts else ""
         arg = " ".join(parts[1:]).strip()
@@ -485,6 +505,7 @@ class DjedApp(App):
             self.transcript_log.clear()
             self.full_log.clear()
             self.session.clear()
+            self._pending_skills = []
             self.say("conversation cleared (KWIM memory is untouched)", "muted")
         elif cmd == "model":
             await self.cmd_model(arg)
@@ -573,6 +594,47 @@ class DjedApp(App):
             f"({self.session.active_tool_count} tools)",
             "muted",
         )
+
+    @staticmethod
+    def _with_skills(skills: list[Skill], request: str) -> str:
+        return "\n\n".join([*(render_loaded(s) for s in skills), "---", request])
+
+    def cmd_skill(self, line: str) -> None:
+        """`/skill` lists; `/skill name [request]` sends a skill's instructions in the
+        prompt. Split by hand rather than by shlex, so the request keeps its quotes.
+        """
+        skills = self.session.deps.skills
+        _, *rest = line[1:].split(None, 2)
+        if not skills:
+            self.say("no skills loaded", "muted")
+            return
+        if not rest:
+            rows = "\n".join(
+                f"- `{s.name}` - {s.description}"
+                + (f" **too large** ({s.size} characters)" if s.oversized else "")
+                for s in skills.values()
+            )
+            self.say_markdown(f"**skills**\n\n{rows}")
+            return
+        skill = skills.get(rest[0])
+        if skill is None:
+            self.say(f"no skill named {rest[0]} (try /skill)", "err")
+            return
+        if skill.oversized:
+            self.say(oversize_warning(skill), "warn")
+        if len(rest) < 2:
+            self._pending_skills.append(skill)
+            self.say(f"skill {skill.name} will be sent with your next prompt", "muted")
+            return
+        try:
+            prompt = self._with_skills([*self._pending_skills, skill], rest[1])
+        except OSError as e:
+            self.say(f"could not read skill: {e}", "err")
+            return
+        finally:
+            self._pending_skills = []
+        self.say(f"you> {line}", "you")
+        self._turn = asyncio.create_task(self.run_turn(prompt))
 
     def cmd_strategy(self, arg: str) -> None:
         if arg not in ("eager", "search"):

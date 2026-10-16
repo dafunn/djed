@@ -18,19 +18,22 @@ from contextlib import AsyncExitStack
 import httpx
 
 from headless import load_env_file
-from djed.agent import build_agent, build_kwim_client
+from djed.agent import build_agent, build_kwim_client, kwim_config_warning
 from djed.mcp import load_tiers
 from djed.persona import default_persona
 from djed.provider import model_id
 from djed.session import Session
+from djed.skills import discover, oversize_warning
 from djed.terminal import tmux_notes
 from djed.tiers import build_strategy
 from djed.tools import Deps
 from djed.tui import DjedApp
+from djed.version import release_version
 
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Djed terminal")
+    ap.add_argument("--version", action="version", version=f"djed {release_version()}")
     # Resolved after --env-file loads, not here: an env file that sets
     # DJED_SESSION or DJED_AGENT has not been read yet at parser-build time.
     ap.add_argument("--session", default=None)
@@ -61,8 +64,12 @@ async def main() -> int:
         model = build_model(args.model)
 
     notes: list[str] = list(tmux_notes())
+    found = discover(persona.tag)
+    notes += found.problems + [oversize_warning(s) for s in found.oversized]
     async with httpx.AsyncClient(timeout=30.0) as http:
         kwim = build_kwim_client(http)
+        if kwim_warning := kwim_config_warning():
+            notes.append(kwim_warning)
 
         tiers = []
         if not args.no_mcp and not args.fake:
@@ -85,11 +92,12 @@ async def main() -> int:
                 capabilities=capabilities,
                 extra_instructions=extra_instructions,
                 persona=persona,
+                skills=found.skills,
             )
 
         session = Session(
             agent=agent_factory(toolsets, capabilities, strategy.instructions),
-            deps=Deps(kwim=kwim, session_id=args.session),
+            deps=Deps(kwim=kwim, session_id=args.session, skills=found.skills),
             kwim=kwim,
             session_id=args.session,
             tiers=tiers,
@@ -103,9 +111,10 @@ async def main() -> int:
             if tiers
             else ""
         )
+        skill_count = f" | {len(found.skills)} skills" if found.skills else ""
         banner = (
-            f"djed - {'stub model' if args.fake else model_id()}"
-            f"{fleet}"
+            f"djed {release_version()} - {'stub model' if args.fake else model_id()}"
+            f"{fleet}{skill_count}"
             "\n/help for commands."
         )
         if notes:

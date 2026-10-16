@@ -25,7 +25,7 @@ from pydantic_ai import (
     UsageLimits,
     capture_run_messages,
 )
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, RetryPromptPart
 
 from .decay import decay
 from .kwim import KwimClient, drop_dangling_tool_calls
@@ -55,6 +55,20 @@ class ToolFinished:
 
 
 TurnEvent = TextChunk | ToolStarted | ToolFinished
+
+
+def _is_error_result(part, content: str) -> bool:
+    """Whether a tool result reports a failure.
+
+    An MCP result with isError set reaches the model as a retry prompt (the
+    toolset's default error behaviour) rather than a return; a tool that raised
+    returns with outcome `failed`; run_command marks a non-zero exit in its text.
+    """
+    if isinstance(part, RetryPromptPart):
+        return True
+    if getattr(part, "outcome", "success") == "failed":
+        return True
+    return content.startswith(EXIT_PREFIX)
 EventSink = Callable[[TurnEvent], None]
 ApprovalFn = Callable[[str, str], Awaitable[bool]]
 # (toolsets, capabilities, extra_instructions, model) -> Agent
@@ -180,6 +194,7 @@ class Session:
         ask_approval: ApprovalFn,
     ) -> TurnResult:
         self._partial = []
+        self.kwim.begin_turn()
         self._task = asyncio.create_task(self._run(prompt, on_event, ask_approval))
         try:
             result = await asyncio.shield(self._task)
@@ -215,6 +230,9 @@ class Session:
         }
         if result.error:
             data["error"] = result.error
+        recalled = self.kwim.recalled_items()
+        if recalled:
+            data["recalled"] = recalled
         try:
             await self.kwim.emit_episodic(self.session_id, "cli_turn", data)
         except asyncio.CancelledError:
@@ -256,7 +274,7 @@ class Session:
                     on_event(
                         ToolFinished(
                             _compact(content, 120),
-                            content.startswith(EXIT_PREFIX),
+                            _is_error_result(event.part, content),
                             full=content,
                         )
                     )

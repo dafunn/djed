@@ -20,7 +20,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 # The exec-mcp toolchain image, not the agent's djed-sandbox.
 IMAGE="${DJED_EXEC_IMAGE:-localhost/djed-exec}"
-CACHE_VOLUME="${DJED_REPO_CACHE:-djed_repo-cache}"
+# The fleet's compose project name prefixes the volume it creates.
+CACHE_VOLUME="${DJED_REPO_CACHE:-${DJED_PROJECT:-djed}_repo-cache}"
 BUILD_ROOT="${DJED_BUILD_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/djed/builds}"
 PY="$REPO/py/.venv/bin/python"
 

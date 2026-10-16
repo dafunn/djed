@@ -17,6 +17,7 @@ dependencies = [
 
     # Imported directly by this package.
     "fastmcp",     # py/djed/mcp.py
+    "mcp",         # py/djed/mcp.py (clientInfo)
     "openai",      # py/djed/provider.py
     "rich",        # py/djed/tui.py
     "tiktoken",    # py/djed/tokens.py

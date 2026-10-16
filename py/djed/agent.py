@@ -5,6 +5,7 @@ argument, not anything baked into the wiring. See `djed/persona.py`.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
@@ -15,10 +16,26 @@ from pydantic_ai.models import Model
 from .kwim import KwimClient, kwim_base, make_transform_context
 from .persona import MAAT, Persona
 from .provider import build_model
-from .tools import Deps, kwim_recall, run_command
+from .skills import Skill, index_instructions
+from .tools import SKILL_TOOLS, Deps, kwim_recall, run_command
+
+log = logging.getLogger("djed.agent")
+
+
+def kwim_config_warning() -> str | None:
+    """Why memory will not work as configured, or None.
+
+    A KWIM URL with no key gets a 401 on every call; the client fails soft, so
+    without this the session would run with no memory and say nothing."""
+    if os.environ.get("KWIM_BASE_URL") and not os.environ.get("DJED_KWIM_API_KEY"):
+        return "KWIM_BASE_URL is set but DJED_KWIM_API_KEY is empty - memory is disabled"
+    return None
 
 
 def build_kwim_client(http: httpx.AsyncClient) -> KwimClient:
+    warning = kwim_config_warning()
+    if warning:
+        log.warning(warning)
     return KwimClient(
         http,
         base_url=kwim_base(),
@@ -35,6 +52,7 @@ def build_agent(
     extra_instructions: str = "",
     persona: Persona = MAAT,
     tools: list | None = None,
+    skills: dict[str, Skill] | None = None,
 ) -> Agent[Deps]:
     """Build the agent.
 
@@ -44,16 +62,21 @@ def build_agent(
 
     `tools` selects the native tool surface: the ops pair by default, and the
     build driver's own set, which omits `run_command`.
+
+    `skills` adds their index to the instructions and the two skill tools. Pass the
+    same dict as `Deps.skills`, which is what the tools read.
     """
     toolsets = toolsets or []
-    tools = [kwim_recall, run_command] if tools is None else tools
+    tools = [kwim_recall, run_command] if tools is None else list(tools)
+    if skills:
+        tools += SKILL_TOOLS
     # ProcessHistory is always first: retrieval runs before anything else looks
     # at the message list.
     caps = [ProcessHistory(make_transform_context(kwim, session_id)), *(capabilities or [])]
     agent = Agent(
         model if model is not None else build_model(),
         deps_type=Deps,
-        instructions=persona.prompt + extra_instructions,
+        instructions=persona.prompt + extra_instructions + index_instructions(skills or {}),
         tools=tools,
         toolsets=toolsets,
         capabilities=caps,

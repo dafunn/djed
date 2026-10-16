@@ -26,7 +26,9 @@ IMAGE="${DJED_SANDBOX_IMAGE:-localhost/djed-sandbox}"
 EXEC_IMAGE="${DJED_EXEC_IMAGE:-localhost/exec-mcp:latest}"
 # The two socat forwards (model and memory) and nothing else - see the
 # `gateways` network in podman/compose.example.yml.
-GATEWAYS="${DJED_GATEWAYS_NETWORK:-djed_gateways}"
+# The fleet's compose project name; its networks and volumes are prefixed by it.
+PROJECT="${DJED_PROJECT:-djed}"
+GATEWAYS="${DJED_GATEWAYS_NETWORK:-${PROJECT}_gateways}"
 BASE_IMAGE="${DJED_BASE_MCP_IMAGE:-localhost/base-mcp:latest}"
 BUILD_ROOT="${DJED_BUILD_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/djed/builds}"
 ENV_FILE="${DJED_ENV_FILE:-$HOME/.djed.env}"
@@ -71,7 +73,7 @@ SPEC="$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")"
 
 if ! podman network exists "$GATEWAYS"; then
   echo "run_build: network '$GATEWAYS' is missing. Re-create the fleet:" >&2
-  echo "    ./podman/setup-fleet.sh" >&2
+  echo "    podman-compose -p $PROJECT -f $HERE/podman/compose.example.yml up -d" >&2
   exit 1
 fi
 

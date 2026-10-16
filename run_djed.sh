@@ -11,13 +11,17 @@
 #   ./run_djed.sh --host --env-file ~/.djed.host.env   # host TUI, host addresses
 set -eo pipefail
 
-IMAGE=localhost/djed-sandbox
+IMAGE="${DJED_SANDBOX_IMAGE:-localhost/djed-sandbox}"
 # Host-side state for the sandboxed TUI (input history); the container
 # filesystem is discarded on exit.
 STATE_DIR="${DJED_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/djed}"
-# Created by the podman fleet's compose project (`podman-compose -p djed`).
-NETWORK="${DJED_TOOLS_NETWORK:-djed_tools}"
+# The podman fleet's compose project name (`podman-compose -p <name>`). Its
+# containers carry it as a label, and its network is `<name>_tools`.
+PROJECT="${DJED_PROJECT:-djed}"
+NETWORK="${DJED_TOOLS_NETWORK:-${PROJECT}_tools}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="$REPO/podman/compose.example.yml"
+UP_CMD="podman-compose -p $PROJECT -f $COMPOSE_FILE up -d"
 MODE=sandbox
 # `local`: the podman fleet on the `tools` network; `forwards`: the in-cluster
 # services, port-forwarded to loopback.
@@ -67,19 +71,23 @@ trap cleanup EXIT INT TERM
 if [ "$FAKE" -eq 0 ] && [ "$NO_MCP" -eq 0 ] && [ "$FLEET" = local ] &&
    [ "$MODE" = sandbox ]; then
   if [ "$BRING_UP" -eq 1 ]; then
-    "$REPO/podman/setup-fleet.sh"
+    if ! command -v podman-compose >/dev/null 2>&1; then
+      echo "error: --up needs podman-compose, which is not installed." >&2
+      exit 1
+    fi
+    podman-compose -p "$PROJECT" -f "$COMPOSE_FILE" up -d
   fi
   if ! podman network exists "$NETWORK"; then
     echo "error: podman network '$NETWORK' does not exist." >&2
-    echo "start the fleet first:  ./podman/setup-fleet.sh   (or re-run with --up)" >&2
+    echo "start the fleet first:  $UP_CMD   (or re-run with --up)" >&2
     echo "(or pass --forwards to use the in-cluster fleet instead)" >&2
     exit 1
   fi
   # A torn-down project leaves the network behind, so check for containers too.
-  running=$(podman ps --filter "label=io.podman.compose.project=djed" --format '{{.Names}}' | wc -l)
+  running=$(podman ps --filter "label=io.podman.compose.project=$PROJECT" --format '{{.Names}}' | wc -l)
   if [ "$running" -eq 0 ]; then
     echo "error: the '$NETWORK' network exists but no fleet containers are running." >&2
-    echo "start them with:  ./podman/setup-fleet.sh   (or re-run with --up)" >&2
+    echo "start them with:  $UP_CMD   (or re-run with --up)" >&2
     exit 1
   fi
   # Off host networking, localhost is the container itself.

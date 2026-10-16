@@ -7,7 +7,12 @@
 #   ../run_djed.sh                    # the agent, joined to `tools`
 #   ../run_build.sh spec.md           # a headless build, same network
 #
-# The project name is fixed: the launchers look for the network `djed_tools`.
+# The launchers find the fleet by its project name, `djed` by default. To run
+# it under another name, pass that name to `-p` and set DJED_PROJECT to it for
+# the launchers:
+#
+#   podman-compose -p djed2 -f compose.example.yml up -d
+#   DJED_PROJECT=djed2 ../run_djed.sh
 #
 # `tools` is an internal network with no route off the host. The agent attaches
 # only to `tools`, so everything it sends or receives passes through a server
@@ -26,12 +31,29 @@
 #   DB_HOST DB_PORT     the database the read-only tier queries
 #   DB_USER             a read-only role
 #   K8S_API K8S_SA      cluster API endpoint and the read-only ServiceAccount
+#   K8S_SA_NAMESPACE    the namespace that ServiceAccount lives in
 #   LOKI_URL            log query endpoint
 #   FORGE_URL           your forge's base URL (forgejo-mcp reads it, repo-mcp
 #                       clones from it)
-#   GIT_OWNERS          the owners repo-mcp enumerates, e.g. `example-org`
 #   LLM_ENDPOINT        host:port of an OpenAI-compatible gateway
 #   MEMORY_ENDPOINT     host:port of the KWIM service
+#
+# Each tier's allowlist is its boundary: what the agent can read through that
+# server, whatever the credential behind it allows. Set them; left empty, a
+# tier reaches everything its credential does.
+#
+#   K8S_ALLOWED_NAMESPACES   namespaces k8s-mcp reads, comma-separated
+#   LOKI_ALLOWED_NAMESPACES  namespaces loki-mcp queries logs for
+#   PG_ALLOWED_DATABASES     databases pg-mcp connects to
+#
+# Repositories are scoped one of two ways. Set exactly one; repo-mcp refuses to
+# start with both:
+#
+#   REPO_ALLOWLIST      named repos only, `owner/name,...` (recommended). Give
+#                       forgejo-mcp the same list: it reads CI for those repos
+#                       and refuses the rest.
+#   GIT_OWNERS          every repo the token can see under these owners, e.g.
+#                       `example-org`. forgejo-mcp is then unrestricted.
 #
 # Credentials are files in ./secrets, mounted as below, not variables.
 
@@ -64,6 +86,7 @@ services:
       PG_PASSWORD_FILE: /run/secrets/db-password
       EXPOSE_RAW_QUERY: "true"
       EXPOSE_METADATA: "true"
+      PG_ALLOWED_DATABASES: ${PG_ALLOWED_DATABASES:-}
     volumes:
       - ./secrets:/run/secrets:ro,z
 
@@ -85,13 +108,14 @@ services:
       K8S_API_SERVER: ${K8S_API}
       K8S_CA_FILE: /run/secrets/cluster-ca.crt
       K8S_SESSION_SERVICE_ACCOUNT: ${K8S_SA}
-      K8S_SESSION_NAMESPACE: djed
+      K8S_SESSION_NAMESPACE: ${K8S_SA_NAMESPACE}
       K8S_SESSION_TTL_SECONDS: "21600"
+      K8S_ALLOWED_NAMESPACES: ${K8S_ALLOWED_NAMESPACES:-}
     volumes:
       - ./secrets:/run/secrets:ro,z
 
   # --- Log reads ------------------------------------------------------------
-  # The one tier that needs no credential.
+  # The one tier that needs no credential, so its allowlist is its only scope.
   loki-mcp:
     image: ${MCP_REGISTRY}/loki-mcp:latest
     networks: [tools, egress]
@@ -102,6 +126,7 @@ services:
       LOKI_URL: ${LOKI_URL}
       EXPOSE_QUERY: "true"
       EXPOSE_METADATA: "true"
+      LOKI_ALLOWED_NAMESPACES: ${LOKI_ALLOWED_NAMESPACES:-}
 
   # --- CI reads -------------------------------------------------------------
   # MCP_ALLOWED_HOSTS is required over SSE: the transport rejects any Host
@@ -117,6 +142,7 @@ services:
       MCP_ALLOWED_HOSTS: forgejo-mcp:3000
       FORGEJO_URL: ${FORGE_URL}
       FORGEJO_TOKEN_FILE: /run/secrets/forge-token
+      REPO_ALLOWLIST: ${REPO_ALLOWLIST:-}
     volumes:
       - ./secrets:/run/secrets:ro,z
 
@@ -125,9 +151,9 @@ services:
   # The cache volume is a credential store: each clone's git config carries the
   # remote's token.
   #
-  # GIT_BASE_URL and GIT_OWNERS are both required - the server refuses to start
-  # without them. GIT_BASE_URL reuses FORGE_URL: repo-mcp clones from the forge
-  # forgejo-mcp reads.
+  # GIT_BASE_URL is required, and so is exactly one of REPO_ALLOWLIST and
+  # GIT_OWNERS (see the header). GIT_BASE_URL reuses FORGE_URL: repo-mcp clones
+  # from the forge forgejo-mcp reads.
   repo-mcp:
     image: ${MCP_REGISTRY}/repo-mcp:latest
     networks: [tools, egress]
@@ -136,7 +162,8 @@ services:
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "3000"
       GIT_BASE_URL: ${FORGE_URL}
-      GIT_OWNERS: ${GIT_OWNERS}
+      REPO_ALLOWLIST: ${REPO_ALLOWLIST:-}
+      GIT_OWNERS: ${GIT_OWNERS:-}
       GIT_TOKEN_FILE: /run/secrets/forge-token
       REPO_CACHE_DIR: /cache
       REPO_DENYLIST: ""

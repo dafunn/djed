@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic_ai import ApprovalRequired, RunContext
 
 from .kwim import KwimClient
+from .skills import Skill, SkillError, read_skill_path, render_loaded
 
 # Prefix on a non-zero-exit tool result. Front ends match on it to style the
 # line, so it is defined once here and imported rather than retyped.
@@ -59,6 +60,8 @@ class Deps:
     # Set by task_complete / task_blocked, and by the build driver after two
     # consecutive inconclusive run_task results. The driver reads it between turns.
     outcome: Outcome | None = None
+    # name -> Skill, from `skills.discover`. Empty means no skill tools.
+    skills: dict[str, Skill] = field(default_factory=dict)
 
 
 async def kwim_recall(ctx: RunContext[Deps], query: str, k: int = 4) -> str:
@@ -75,7 +78,58 @@ async def kwim_recall(ctx: RunContext[Deps], query: str, k: int = 4) -> str:
         k: How many chunks to retrieve; keep small (3-5).
     """
     hits = await ctx.deps.kwim.semantic_recall(query, k)
+    if hits is None:
+        return f"(KWIM is unavailable: {ctx.deps.kwim.last_failure})"
     return "\n\n---\n\n".join(hits) if hits else "(no matching knowledge in KWIM)"
+
+
+def _unknown_skill(ctx: RunContext[Deps], name: str) -> str:
+    known = ", ".join(ctx.deps.skills) or "(none)"
+    return f"No skill named {name!r}. Available: {known}."
+
+
+async def load_skill(ctx: RunContext[Deps], name: str) -> str:
+    """Load a skill's instructions. Call this before starting a task that one of
+    the skills listed in your instructions covers, then follow what it says.
+
+    The result stays in the conversation, so load each skill once.
+
+    Args:
+        name: The skill's name, exactly as listed.
+    """
+    skill = ctx.deps.skills.get(name)
+    if skill is None:
+        return _unknown_skill(ctx, name)
+    try:
+        return render_loaded(skill)
+    except (OSError, UnicodeDecodeError) as e:
+        return f"Could not read skill {name!r}: {e}"
+
+
+async def read_skill_file(ctx: RunContext[Deps], name: str, path: str) -> str:
+    """Read one of a loaded skill's other files, such as a reference document or
+    a template. Read one only when the skill's instructions send you to it.
+
+    Args:
+        name: The skill's name.
+        path: The file's path inside the skill, as load_skill listed it.
+    """
+    skill = ctx.deps.skills.get(name)
+    if skill is None:
+        return _unknown_skill(ctx, name)
+    try:
+        data = read_skill_path(skill, path).read_bytes()
+    except SkillError as e:
+        return str(e)
+    except OSError as e:
+        return f"Could not read {path!r}: {e}"
+    text = data[:MAX_OUTPUT].decode("utf-8", errors="replace")
+    if len(data) > MAX_OUTPUT:
+        text += f"\n[... truncated at {MAX_OUTPUT} bytes]"
+    return text
+
+
+SKILL_TOOLS = [load_skill, read_skill_file]
 
 
 # The paragraph of the description that depends on the machine.

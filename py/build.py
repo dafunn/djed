@@ -31,9 +31,11 @@ from djed.persona import BUILDER, default_persona
 from djed.spec import SpecError, parse_spec
 from djed.tiers import WRITE_TOOLS, build_strategy
 from djed.session import Session, TextChunk, ToolFinished, ToolStarted, TurnEvent
+from djed.skills import discover, oversize_warning
 from djed.handoff import HANDOFF, render_handoff, resume_preamble
 from djed.tools import Deps, Outcome, kwim_recall, task_blocked, task_complete
 from djed.trace import format_trace, totals
+from djed.version import release_version
 from headless import load_env_file
 
 DIM = "\x1b[2m"
@@ -260,6 +262,7 @@ def _seed_prompt(workspace_md: str, prose: str, preamble: str = "") -> str:
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Headless djed build driver")
+    ap.add_argument("--version", action="version", version=f"djed {release_version()}")
     ap.add_argument("spec", help="path to the spec file (TOML frontmatter + prose)")
     ap.add_argument(
         "--workspace",
@@ -371,6 +374,10 @@ async def main() -> int:
                 file=sys.stderr,
             )
 
+        found = discover(persona.tag)
+        for note in found.problems + [oversize_warning(s) for s in found.oversized]:
+            print(_c(YELLOW, note), file=sys.stderr)
+
         agent = build_agent(
             kwim,
             session_id,
@@ -382,8 +389,9 @@ async def main() -> int:
             # No shell tool: task_complete/task_blocked plus memory recall. Execution goes
             # through exec-mcp's run_task.
             tools=[kwim_recall, task_complete, task_blocked],
+            skills=found.skills,
         )
-        deps = Deps(kwim=kwim, session_id=session_id)
+        deps = Deps(kwim=kwim, session_id=session_id, skills=found.skills)
         session = Session(
             agent=agent,
             deps=deps,

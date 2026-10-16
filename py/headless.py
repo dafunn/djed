@@ -17,10 +17,12 @@ import httpx
 from djed.agent import build_agent, build_kwim_client
 from djed.mcp import load_tiers
 from djed.persona import default_persona
-from djed.tiers import build_strategy
+from djed.tiers import WRITE_TOOLS, build_strategy
 from djed.provider import list_models
 from djed.session import Session, TextChunk, ToolFinished, ToolStarted, TurnEvent
+from djed.skills import discover, oversize_warning
 from djed.tools import Deps
+from djed.version import release_version
 
 DIM = "\x1b[2m"
 CYAN = "\x1b[36m"
@@ -68,22 +70,23 @@ def _render_event(event: TurnEvent) -> None:
         print(_c(style, f"  {marker}{event.text}"), flush=True)
 
 
-async def _ask_approval(command: str, mode: str) -> bool:
+async def _ask_approval(tool_name: str, detail: str, mode: str) -> bool:
     """Operator approval gate - the console stand-in for the TUI's y/n prompt."""
     if mode == "auto":
-        print(_c(DIM, f"  auto-approved: {command}"), flush=True)
+        print(_c(DIM, f"  auto-approved: {tool_name} {detail}"), flush=True)
         return True
     if mode == "deny":
-        print(_c(RED, f"  auto-denied: {command}"), flush=True)
+        print(_c(RED, f"  auto-denied: {tool_name} {detail}"), flush=True)
         return False
     answer = await asyncio.to_thread(
-        input, f"\n{_c(YELLOW, '[approve (y/n)]')} run: {command} "
+        input, f"\n{_c(YELLOW, '[approve (y/n)]')} {tool_name}: {detail} "
     )
     return answer.strip().lower().startswith("y")
 
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Headless Djed")
+    ap.add_argument("--version", action="version", version=f"djed {release_version()}")
     ap.add_argument("prompt", nargs="*", help="prompt (reads stdin if omitted)")
     # Resolved after --env-file loads (see tui.py).
     ap.add_argument("--session", default=None)
@@ -92,7 +95,11 @@ async def main() -> int:
         "--approve",
         choices=["ask", "auto", "deny"],
         default="ask",
-        help="how to answer the run_command approval gate (default: ask)",
+        help=(
+            "how to answer the approval gate, which holds run_command and base-mcp's "
+            f"file writes ({', '.join(sorted(WRITE_TOOLS))}) unless DJED_GATE_WRITES "
+            "is off (default: ask)"
+        ),
     )
     ap.add_argument("--no-mcp", action="store_true", help="skip the MCP fleet bridge")
     ap.add_argument(
@@ -175,6 +182,10 @@ async def main() -> int:
                 file=sys.stderr,
             )
 
+        found = discover(persona.tag)
+        for note in found.problems + [oversize_warning(s) for s in found.oversized]:
+            print(_c(YELLOW, note), file=sys.stderr)
+
         agent = build_agent(
             kwim,
             args.session,
@@ -183,18 +194,19 @@ async def main() -> int:
             capabilities=capabilities,
             extra_instructions=extra_instructions,
             persona=persona,
+            skills=found.skills,
         )
 
         session = Session(
             agent=agent,
-            deps=Deps(kwim=kwim, session_id=args.session),
+            deps=Deps(kwim=kwim, session_id=args.session, skills=found.skills),
             kwim=kwim,
             session_id=args.session,
         )
         print(_c(DIM, f"you> {prompt}\n"))
 
         async def approve(tool_name: str, detail: str) -> bool:
-            return await _ask_approval(detail, args.approve)
+            return await _ask_approval(tool_name, detail, args.approve)
 
         async with agent:
             result = await session.run_turn(prompt, _render_event, approve)

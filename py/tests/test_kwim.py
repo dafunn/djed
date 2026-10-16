@@ -116,6 +116,7 @@ def test_last_user_text_ignores_our_own_injection():
 
 class StubKwim(KwimClient):
     def __init__(self, recall: list[str] | None = None, warm: list[str] | None = None):
+        super().__init__(None)  # type: ignore[arg-type] - no HTTP; every call is overridden
         self._recall = recall or []
         self._warm = warm or []
         self.recall_calls = 0
@@ -128,6 +129,9 @@ class StubKwim(KwimClient):
     async def warm_start(self, session_id, subject):
         self.warm_calls += 1
         return list(self._warm)
+
+    async def emit_episodic(self, session_id, event_type, event_data):
+        return None
 
 
 @pytest.mark.asyncio
@@ -178,7 +182,7 @@ async def test_recall_is_fail_soft_on_transport_error():
         raise httpx.ConnectError("connection refused", request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as c:
-        assert await KwimClient(c).semantic_recall("anything") == []
+        assert await KwimClient(c).semantic_recall("anything") is None
 
 
 @pytest.mark.asyncio
@@ -186,7 +190,7 @@ async def test_recall_is_fail_soft_on_a_500():
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(500, text="nope"))
     ) as c:
-        assert await KwimClient(c).semantic_recall("anything") == []
+        assert await KwimClient(c).semantic_recall("anything") is None
 
 
 @pytest.mark.asyncio
@@ -194,7 +198,7 @@ async def test_recall_is_fail_soft_on_an_unexpected_payload():
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"not": "a list"}))
     ) as c:
-        assert await KwimClient(c).semantic_recall("anything") == []
+        assert await KwimClient(c).semantic_recall("anything") is None
 
 
 @pytest.mark.asyncio
@@ -216,3 +220,154 @@ async def test_episodic_write_never_raises():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as c:
         await KwimClient(c).emit_episodic("s1", "cli_turn", {"request": "q"})
+
+
+# --- what a turn recalled ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recall_notes_each_item_once_until_the_next_turn():
+    payload = [
+        {"id": "runbook:backups", "content": "Snapshots start at 02:15 UTC.",
+         "metadata": {"topic": "backups"}, "score": 0.3},
+        {"id": "runbook:restore", "content": "Restores need the tern key.",
+         "metadata": {"topic": "restore"}, "score": 0.4},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    ) as c:
+        kwim = KwimClient(c)
+        kwim.begin_turn()
+        await kwim.semantic_recall("backups")
+        await kwim.semantic_recall("backups again")      # same items: noted once
+        items = kwim.recalled_items()
+        assert [i["id"] for i in items] == ["runbook:backups", "runbook:restore"]
+        assert items[0] == {"kind": "semantic", "id": "runbook:backups",
+                            "text": "Snapshots start at 02:15 UTC."}
+        kwim.begin_turn()
+        assert kwim.recalled_items() == []
+
+
+@pytest.mark.asyncio
+async def test_warm_start_notes_facts_and_rules():
+    payload = {"wisdom": [{"id": "rule-1", "approach": "Drain the queue first."}],
+               "knowledge": [{"id": "fact-1", "statement": "quokka-07 is the backup host."}]}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    ) as c:
+        kwim = KwimClient(c)
+        kwim.begin_turn()
+        await kwim.warm_start("s1", "backups")
+        assert kwim.recalled_items() == [
+            {"kind": "rule", "id": "rule-1", "text": "Drain the queue first."},
+            {"kind": "fact", "id": "fact-1", "text": "quokka-07 is the backup host."},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_failed_recall_notes_nothing():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "no"}))
+    ) as c:
+        kwim = KwimClient(c)
+        kwim.begin_turn()
+        await kwim.semantic_recall("backups")
+        assert kwim.recalled_items() == []
+
+
+# --- failures are reported, once per kind ---------------------------------
+
+
+def _always(status: int, body=None):
+    return httpx.MockTransport(lambda r: httpx.Response(status, json=body if body is not None else {}))
+
+
+@pytest.mark.asyncio
+async def test_a_401_warns_once_for_repeated_calls(caplog):
+    async with httpx.AsyncClient(transport=_always(401)) as c:
+        kwim = KwimClient(c)
+        with caplog.at_level("DEBUG", logger="djed.kwim"):
+            for _ in range(3):
+                assert await kwim.semantic_recall("anything") is None
+            await kwim.warm_start("s1", "anything")
+            await kwim.emit_episodic("s1", "cli_turn", {"request": "q"})
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "HTTP 401" in warnings[0].getMessage() and "DJED_KWIM_API_KEY" in warnings[0].getMessage()
+    assert not kwim.available
+    assert kwim.drain_notices() == [warnings[0].getMessage()]
+    assert kwim.drain_notices() == []
+
+
+@pytest.mark.asyncio
+async def test_each_kind_of_failure_warns_once(caplog):
+    calls = {"n": 0}
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] % 2:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(503, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(flaky)) as c:
+        kwim = KwimClient(c)
+        with caplog.at_level("DEBUG", logger="djed.kwim"):
+            for _ in range(4):
+                await kwim.semantic_recall("anything")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert any("ConnectError" in w for w in warnings) and any("HTTP 503" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_a_success_marks_memory_available_again():
+    responses = iter([httpx.Response(500, json={}), httpx.Response(200, json=[])])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: next(responses))) as c:
+        kwim = KwimClient(c)
+        assert await kwim.semantic_recall("x") is None
+        assert not kwim.available
+        assert await kwim.semantic_recall("x") == []
+        assert kwim.available
+
+
+@pytest.mark.asyncio
+async def test_a_failed_episodic_write_is_reported(caplog):
+    async with httpx.AsyncClient(transport=_always(401)) as c:
+        kwim = KwimClient(c)
+        with caplog.at_level("WARNING", logger="djed.kwim"):
+            await kwim.emit_episodic("s1", "cli_turn", {"request": "q"})
+    assert any("record failed: HTTP 401" in r.getMessage() for r in caplog.records)
+
+
+async def _kwim_recall_with(transport) -> str:
+    from types import SimpleNamespace
+
+    from djed.tools import Deps, kwim_recall
+
+    async with httpx.AsyncClient(transport=transport) as c:
+        ctx = SimpleNamespace(deps=Deps(kwim=KwimClient(c), session_id="s"))
+        return await kwim_recall(ctx, "anything")
+
+
+@pytest.mark.asyncio
+async def test_kwim_recall_says_when_kwim_is_unavailable():
+    out = await _kwim_recall_with(_always(401))
+    assert out == "(KWIM is unavailable: HTTP 401 (check DJED_KWIM_API_KEY))"
+
+
+@pytest.mark.asyncio
+async def test_kwim_recall_keeps_the_no_match_message_for_an_empty_result():
+    assert await _kwim_recall_with(_always(200, [])) == "(no matching knowledge in KWIM)"
+
+
+def test_startup_warns_when_the_url_is_set_without_a_key(monkeypatch):
+    from djed.agent import kwim_config_warning
+
+    monkeypatch.setenv("KWIM_BASE_URL", "http://kwim.test:8000")
+    monkeypatch.setenv("DJED_KWIM_API_KEY", "")
+    assert "memory is disabled" in kwim_config_warning()
+    monkeypatch.setenv("DJED_KWIM_API_KEY", "k")
+    assert kwim_config_warning() is None
+    monkeypatch.delenv("KWIM_BASE_URL")
+    monkeypatch.delenv("DJED_KWIM_API_KEY")
+    assert kwim_config_warning() is None

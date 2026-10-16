@@ -527,3 +527,43 @@ async def test_reconcile_dry_run_emits_no_writes(tmp_path: Path):
     assert len(client.proposals) == proposals_before  # no writes at all
     assert len(result["tombstones"]) == 4  # would-be tombstones still reported
     assert all("id" not in t for t in result["tombstones"])  # never actually created
+
+
+# --- the command line: dry run unless --commit ----------------------------
+
+
+def _run_main(tmp_path: Path, monkeypatch, *extra: str) -> tuple[int, _FakeKwimClient]:
+    root = tmp_path / "site-cli"
+    root.mkdir()
+    _write_flat_inventory(root, ["host-1", "host-2"])
+    client = _FakeKwimClient()
+    monkeypatch.setattr(ansible_source, "KwimClient", lambda *a, **kw: client)
+    rc = ansible_source.main([
+        "--team", "team-a", "--inventory", str(root), "--conf", str(root),
+        "--env", "site-cli", "--key", "test-key", *extra,
+    ])
+    return rc, client
+
+
+def test_no_writes_without_commit(tmp_path: Path, monkeypatch):
+    rc, client = _run_main(tmp_path, monkeypatch)
+    assert rc == 0
+    assert client.proposals == [] and client.facts == []
+
+
+def test_dry_run_flag_is_still_accepted_and_writes_nothing(tmp_path: Path, monkeypatch):
+    rc, client = _run_main(tmp_path, monkeypatch, "--dry-run")
+    assert rc == 0
+    assert client.facts == []
+
+
+def test_commit_writes(tmp_path: Path, monkeypatch):
+    rc, client = _run_main(tmp_path, monkeypatch, "--commit")
+    assert rc == 0
+    assert client.facts, "--commit must sync the facts"
+
+
+def test_commit_and_dry_run_together_are_refused(tmp_path: Path, monkeypatch):
+    rc, client = _run_main(tmp_path, monkeypatch, "--commit", "--dry-run")
+    assert rc == 2
+    assert client.facts == []
